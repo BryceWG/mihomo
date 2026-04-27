@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"hash/fnv"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +23,7 @@ const (
 	defaultPrefetchMinTTL       = 120
 	defaultPrefetchBackoffBase  = 30 * time.Second
 	defaultPrefetchBackoffMax   = 5 * time.Minute
+	defaultPrefetchScanBatch    = 3
 )
 
 type prefetchConfig struct {
@@ -62,6 +64,13 @@ type prefetchManager struct {
 	stop     chan struct{}
 	done     chan struct{}
 	wg       sync.WaitGroup
+}
+
+type prefetchCandidate struct {
+	entry        *prefetchEntry
+	key          string
+	remainingTTL time.Duration
+	refreshCount int32
 }
 
 func newPrefetchConfig(config Config) prefetchConfig {
@@ -293,17 +302,23 @@ func (p *prefetchManager) scan(now time.Time) {
 	}
 	p.mu.RUnlock()
 
-	for _, entry := range entries {
-		if !p.shouldPrefetch(entry, now) {
-			continue
-		}
+	candidates := p.prefetchCandidates(entries, now)
+	sortPrefetchCandidates(candidates)
 
+	launched := 0
+	limit := p.prefetchScanBatchLimit()
+	for _, candidate := range candidates {
+		if launched >= limit {
+			return
+		}
+		entry := candidate.entry
 		if !entry.inFlight.CompareAndSwap(false, true) {
 			continue
 		}
 
 		select {
 		case p.sem <- struct{}{}:
+			launched++
 			p.wg.Add(1)
 			go func(entry *prefetchEntry) {
 				defer func() {
@@ -321,21 +336,39 @@ func (p *prefetchManager) scan(now time.Time) {
 }
 
 func (p *prefetchManager) shouldPrefetch(entry *prefetchEntry, now time.Time) bool {
+	_, ok := p.prefetchCandidate(entry, now)
+	return ok
+}
+
+func (p *prefetchManager) prefetchCandidates(entries []*prefetchEntry, now time.Time) []prefetchCandidate {
+	candidates := make([]prefetchCandidate, 0, len(entries))
+	for _, entry := range entries {
+		candidate, ok := p.prefetchCandidate(entry, now)
+		if !ok {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
+func (p *prefetchManager) prefetchCandidate(entry *prefetchEntry, now time.Time) (prefetchCandidate, bool) {
 	if !p.resolver.cache.Exist(entry.key) {
 		p.remove(entry.key)
-		return false
+		return prefetchCandidate{}, false
 	}
-	if entry.refreshCount.Load() < p.config.minRefreshes {
+	refreshCount := entry.refreshCount.Load()
+	if refreshCount < p.config.minRefreshes {
 		if p.shouldRemoveColdEntry(entry, now) {
 			p.remove(entry.key)
 		}
-		return false
+		return prefetchCandidate{}, false
 	}
 
 	entry.mu.Lock()
 	if !entry.nextPrefetchAttempt.IsZero() && now.Before(entry.nextPrefetchAttempt) {
 		entry.mu.Unlock()
-		return false
+		return prefetchCandidate{}, false
 	}
 	expire := entry.expire
 	question := entry.question
@@ -344,22 +377,52 @@ func (p *prefetchManager) shouldPrefetch(entry *prefetchEntry, now time.Time) bo
 	msg, cacheExpire, hit := getMsgFromCache(p.resolver.cache, question)
 	if !hit || msg == nil {
 		p.remove(entry.key)
-		return false
+		return prefetchCandidate{}, false
 	}
 	if !cacheExpire.Equal(expire) {
-		return false
+		return prefetchCandidate{}, false
 	}
 	remaining := expire.Sub(now)
 	if remaining > p.config.threshold {
-		return false
+		return prefetchCandidate{}, false
 	}
 	if p.resolver.optimisticCacheTTL == 0 && remaining < 0 {
-		return false
+		return prefetchCandidate{}, false
 	}
 	if p.resolver.optimisticCacheTTL > 0 && remaining < -p.resolver.optimisticCacheTTL {
-		return false
+		return prefetchCandidate{}, false
 	}
-	return true
+	return prefetchCandidate{
+		entry:        entry,
+		key:          entry.key,
+		remainingTTL: remaining,
+		refreshCount: refreshCount,
+	}, true
+}
+
+func sortPrefetchCandidates(candidates []prefetchCandidate) {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left := candidates[i]
+		right := candidates[j]
+		if left.remainingTTL != right.remainingTTL {
+			return left.remainingTTL < right.remainingTTL
+		}
+		if left.refreshCount != right.refreshCount {
+			return left.refreshCount > right.refreshCount
+		}
+		return left.key < right.key
+	})
+}
+
+func (p *prefetchManager) prefetchScanBatchLimit() int {
+	maxConcurrent := p.config.maxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultPrefetchConcurrency
+	}
+	if maxConcurrent < defaultPrefetchScanBatch {
+		return maxConcurrent
+	}
+	return defaultPrefetchScanBatch
 }
 
 func (p *prefetchManager) shouldRemoveColdEntry(entry *prefetchEntry, now time.Time) bool {
