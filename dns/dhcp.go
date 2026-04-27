@@ -49,7 +49,7 @@ func (d *dhcpClient) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg,
 		return nil, err
 	}
 
-	msg, _, err = batchExchange(ctx, clients, m)
+	msg, _, err = batchExchange(ctx, clients, m, nil)
 	return
 }
 

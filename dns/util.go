@@ -397,7 +397,7 @@ func msgToLogString(msg *D.Msg) string {
 	}
 }
 
-func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.Msg, cache bool, err error) {
+func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg, stats *dnsStats) (msg *D.Msg, cache bool, err error) {
 	cache = true
 	fast, ctx := picker.WithTimeout[*D.Msg](ctx, resolver.DefaultDNSTimeout)
 	defer fast.Close()
@@ -410,6 +410,11 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
 		}
 		client := client // shadow define client to ensure the value captured by the closure will not be changed in the next loop
 		fast.Go(func() (*D.Msg, error) {
+			start := time.Now()
+			defer func() {
+				stats.recordServerRequest(time.Since(start))
+			}()
+
 			log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
 			m, err := client.ExchangeContext(ctx, m)
 			if err != nil {

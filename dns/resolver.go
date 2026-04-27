@@ -50,6 +50,7 @@ type Resolver struct {
 	fallbackIPFilters        []C.IpMatcher
 	group                    singleflight.Group[*D.Msg]
 	cache                    dnsCache
+	stats                    *dnsStats
 	policy                   []dnsPolicy
 	defaultResolver          *Resolver
 	optimisticCache          bool
@@ -159,6 +160,11 @@ func (r *Resolver) ResolveECH(ctx context.Context, host string) ([]byte, error) 
 
 // ExchangeContext a batch of dns request with context.Context, and it use cache
 func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+	start := time.Now()
+	defer func() {
+		r.stats.recordQuery(time.Since(start))
+	}()
+
 	if len(m.Question) == 0 {
 		return nil, errors.New("should have one question at least")
 	}
@@ -182,22 +188,26 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 		now := time.Now()
 		if expireTime.Before(now) {
 			if !r.optimisticCacheAlive(msg, expireTime, now) {
+				r.stats.recordCacheMiss()
 				msg, err = r.exchangeWithoutCache(ctx, m, true)
 				if msg != nil {
 					clampMsgTTL(msg, r.minTTL, r.maxTTL)
 				}
 				return
 			}
+			r.stats.recordCacheHit(true)
 			setMsgTTL(msg, r.optimisticCacheAnswerTTL) // Continue fetch
 			continueFetch = true
 			cacheFailure = false
 		} else {
+			r.stats.recordCacheHit(false)
 			// updating TTL by subtracting common delta time from each DNS record
 			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
 			clampMsgTTL(msg, r.minTTL, r.maxTTL)
 		}
 		return
 	}
+	r.stats.recordCacheMiss()
 	msg, err = r.exchangeWithoutCache(ctx, m, true)
 	if msg != nil {
 		clampMsgTTL(msg, r.minTTL, r.maxTTL)
@@ -240,10 +250,10 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg, cacheFail
 		}
 
 		if matched := r.matchPolicy(m); len(matched) != 0 {
-			result, cache, err = batchExchange(ctx, matched, m)
+			result, cache, err = batchExchange(ctx, matched, m, r.stats)
 			return
 		}
-		result, cache, err = batchExchange(ctx, r.main, m)
+		result, cache, err = batchExchange(ctx, r.main, m, r.stats)
 		return
 	}
 
@@ -396,7 +406,7 @@ func (r *Resolver) lookupIP(ctx context.Context, host string, dnsType uint16) (i
 func (r *Resolver) asyncExchange(ctx context.Context, client []dnsClient, msg *D.Msg) <-chan *result {
 	ch := make(chan *result, 1)
 	go func() {
-		res, _, err := batchExchange(ctx, client, msg)
+		res, _, err := batchExchange(ctx, client, msg, r.stats)
 		ch <- &result{Msg: res, Error: err}
 	}()
 	return ch
@@ -452,6 +462,20 @@ func (r *Resolver) ResetConnection() {
 			dr.ResetConnection()
 		}
 	}
+}
+
+func (r *Resolver) DNSStats() DNSStatsSnapshot {
+	if r == nil {
+		return DNSStatsSnapshot{}
+	}
+	return r.stats.snapshot()
+}
+
+func (r *Resolver) ResetDNSStats() {
+	if r == nil {
+		return
+	}
+	r.stats.reset()
 }
 
 type NameServer struct {
@@ -575,12 +599,33 @@ func (rs Resolvers) CloseDNSCache() {
 	rs.DirectResolver.CloseDNSCache()
 }
 
+func (rs Resolvers) DNSStats() DNSStatsSnapshot {
+	stats := newDNSStats()
+	stats.addSnapshot(rs.Resolver.DNSStats())
+	if rs.Resolver != nil {
+		stats.addSnapshot(rs.Resolver.defaultResolver.DNSStats())
+	}
+	stats.addSnapshot(rs.ProxyResolver.DNSStats())
+	stats.addSnapshot(rs.DirectResolver.DNSStats())
+	return stats.snapshot()
+}
+
+func (rs Resolvers) ResetDNSStats() {
+	rs.Resolver.ResetDNSStats()
+	if rs.Resolver != nil {
+		rs.Resolver.defaultResolver.ResetDNSStats()
+	}
+	rs.ProxyResolver.ResetDNSStats()
+	rs.DirectResolver.ResetDNSStats()
+}
+
 func NewResolver(config Config) (rs Resolvers) {
 	optimisticCacheTTL := config.optimisticCacheTTL()
 	optimisticCacheAnswerTTL := config.optimisticCacheAnswerTTL()
 	defaultResolver := &Resolver{
 		main:        transform(config.Default, nil),
 		cache:       config.newCache("default"),
+		stats:       newDNSStats(),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 		minTTL:      config.MinTTL,
 		maxTTL:      config.MaxTTL,
@@ -647,6 +692,7 @@ func NewResolver(config Config) (rs Resolvers) {
 		ipv6:        config.IPv6,
 		main:        cacheTransform(config.Main),
 		cache:       config.newCache("main"),
+		stats:       newDNSStats(),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 		policy:      makePolicy(config.Policy),
 		minTTL:      config.MinTTL,
@@ -663,6 +709,7 @@ func NewResolver(config Config) (rs Resolvers) {
 			ipv6:        config.IPv6,
 			main:        cacheTransform(config.ProxyServer),
 			cache:       config.newCache("proxy"),
+			stats:       newDNSStats(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 			policy:      makePolicy(config.ProxyServerPolicy),
 			minTTL:      config.MinTTL,
@@ -678,6 +725,7 @@ func NewResolver(config Config) (rs Resolvers) {
 			ipv6:        config.IPv6,
 			main:        cacheTransform(config.DirectServer),
 			cache:       config.newCache("direct"),
+			stats:       newDNSStats(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 			minTTL:      config.MinTTL,
 			maxTTL:      config.MaxTTL,

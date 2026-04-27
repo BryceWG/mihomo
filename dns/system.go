@@ -38,7 +38,7 @@ func (c *systemClient) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Ms
 	if err != nil {
 		return
 	}
-	msg, _, err = batchExchange(ctx, dnsClients, m)
+	msg, _, err = batchExchange(ctx, dnsClients, m, nil)
 	return
 }
 
