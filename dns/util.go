@@ -45,6 +45,35 @@ func updateTTL(records []D.RR, ttl uint32) {
 	}
 }
 
+func clampTTL(ttl, minTTL, maxTTL uint32) uint32 {
+	if minTTL > 0 && ttl < minTTL {
+		ttl = minTTL
+	}
+	if maxTTL > 0 && ttl > maxTTL {
+		ttl = maxTTL
+	}
+	return ttl
+}
+
+func clampMsgTTL(msg *D.Msg, minTTL, maxTTL uint32) {
+	if msg == nil || (minTTL == 0 && maxTTL == 0) {
+		return
+	}
+
+	clampRecords := func(records []D.RR) {
+		for _, rr := range records {
+			if rr.Header().Rrtype == D.TypeOPT {
+				continue
+			}
+			rr.Header().Ttl = clampTTL(rr.Header().Ttl, minTTL, maxTTL)
+		}
+	}
+
+	clampRecords(msg.Answer)
+	clampRecords(msg.Ns)
+	clampRecords(msg.Extra)
+}
+
 // getMsgFromCache returns a cached dns message if it exists, otherwise returns nil.
 // the returned msg is a copy of the original msg, so it can be modified without affecting the original msg.
 func getMsgFromCache(c dnsCache, q D.Question) (*D.Msg, time.Time, bool) {
@@ -57,7 +86,7 @@ func getMsgFromCache(c dnsCache, q D.Question) (*D.Msg, time.Time, bool) {
 
 // putMsgToCache puts a dns message into the cache.
 // the msg is copied before being stored in the cache, so it can be modified without affecting the original msg.
-func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg) {
+func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg, minTTL, maxTTL uint32) {
 	// skip dns cache for acme challenge
 	if q.Qtype == D.TypeTXT && strings.HasPrefix(q.Name, "_acme-challenge.") {
 		log.Debugln("[DNS] dns cache ignored because of acme challenge for: %s", q.Name)
@@ -70,6 +99,7 @@ func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg) {
 	msg.Extra = lo.Filter(msg.Extra, func(rr D.RR, index int) bool {
 		return rr.Header().Rrtype != D.TypeOPT
 	})
+	clampMsgTTL(msg, minTTL, maxTTL)
 
 	var ttl uint32
 	if msg.Rcode == D.RcodeServerFailure {

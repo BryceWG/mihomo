@@ -47,6 +47,8 @@ type Resolver struct {
 	cache                 dnsCache
 	policy                []dnsPolicy
 	defaultResolver       *Resolver
+	minTTL                uint32
+	maxTTL                uint32
 }
 
 func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
@@ -175,10 +177,15 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 		} else {
 			// updating TTL by subtracting common delta time from each DNS record
 			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
+			clampMsgTTL(msg, r.minTTL, r.maxTTL)
 		}
 		return
 	}
-	return r.exchangeWithoutCache(ctx, m)
+	msg, err = r.exchangeWithoutCache(ctx, m)
+	if msg != nil {
+		clampMsgTTL(msg, r.minTTL, r.maxTTL)
+	}
+	return
 }
 
 // ExchangeWithoutCache a batch of dns request, and it do NOT GET from cache
@@ -201,7 +208,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 			}
 
 			if cache {
-				putMsgToCache(r.cache, q, result)
+				putMsgToCache(r.cache, q, result, r.minTTL, r.maxTTL)
 			}
 		}()
 
@@ -447,6 +454,8 @@ type Config struct {
 	ProxyServerPolicy    []Policy
 	CacheAlgorithm       string
 	CacheMaxSize         int
+	MinTTL               uint32
+	MaxTTL               uint32
 }
 
 func (config Config) newCache() dnsCache {
@@ -484,6 +493,8 @@ func NewResolver(config Config) (rs Resolvers) {
 		main:        transform(config.Default, nil),
 		cache:       config.newCache(),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
+		minTTL:      config.MinTTL,
+		maxTTL:      config.MaxTTL,
 	}
 
 	var nameServerCache []struct {
@@ -546,6 +557,8 @@ func NewResolver(config Config) (rs Resolvers) {
 		cache:       config.newCache(),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 		policy:      makePolicy(config.Policy),
+		minTTL:      config.MinTTL,
+		maxTTL:      config.MaxTTL,
 	}
 	r.defaultResolver = defaultResolver
 	rs.Resolver = r
@@ -557,6 +570,8 @@ func NewResolver(config Config) (rs Resolvers) {
 			cache:       config.newCache(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 			policy:      makePolicy(config.ProxyServerPolicy),
+			minTTL:      config.MinTTL,
+			maxTTL:      config.MaxTTL,
 		}
 	}
 
@@ -566,6 +581,8 @@ func NewResolver(config Config) (rs Resolvers) {
 			main:        cacheTransform(config.DirectServer),
 			cache:       config.newCache(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
+			minTTL:      config.MinTTL,
+			maxTTL:      config.MaxTTL,
 		}
 		if config.DirectFollowPolicy {
 			rs.DirectResolver.policy = r.policy

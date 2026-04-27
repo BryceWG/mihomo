@@ -158,6 +158,8 @@ type DNS struct {
 	DefaultNameserver     []dns.NameServer
 	CacheAlgorithm        string
 	CacheMaxSize          int
+	MinTTL                uint32
+	MaxTTL                uint32
 	FakeIPRange           netip.Prefix
 	FakeIPPool            *fakeip.Pool
 	FakeIPRange6          netip.Prefix
@@ -235,6 +237,8 @@ type RawDNS struct {
 	DefaultNameserver            []string                            `yaml:"default-nameserver" json:"default-nameserver"`
 	CacheAlgorithm               string                              `yaml:"cache-algorithm" json:"cache-algorithm"`
 	CacheMaxSize                 int                                 `yaml:"cache-max-size" json:"cache-max-size"`
+	MinTTL                       uint32                              `yaml:"min-ttl" json:"min-ttl"`
+	MaxTTL                       uint32                              `yaml:"max-ttl" json:"max-ttl"`
 	NameServerPolicy             *orderedmap.OrderedMap[string, any] `yaml:"nameserver-policy" json:"nameserver-policy"`
 	ProxyServerNameserver        []string                            `yaml:"proxy-server-nameserver" json:"proxy-server-nameserver"`
 	ProxyServerNameserverPolicy  *orderedmap.OrderedMap[string, any] `yaml:"proxy-server-nameserver-policy" json:"proxy-server-nameserver-policy"`
@@ -1378,6 +1382,9 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 	if cfg.RespectRules && len(cfg.ProxyServerNameserver) == 0 {
 		return nil, fmt.Errorf("if “respect-rules” is turned on, “proxy-server-nameserver” cannot be empty")
 	}
+	if cfg.MinTTL > 0 && cfg.MaxTTL > 0 && cfg.MinTTL > cfg.MaxTTL {
+		return nil, fmt.Errorf("dns min-ttl should be less than or equal to max-ttl")
+	}
 
 	dnsCfg := &DNS{
 		Enable:         cfg.Enable,
@@ -1390,6 +1397,8 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		EnhancedMode:   cfg.EnhancedMode,
 		CacheAlgorithm: cfg.CacheAlgorithm,
 		CacheMaxSize:   cfg.CacheMaxSize,
+		MinTTL:         cfg.MinTTL,
+		MaxTTL:         cfg.MaxTTL,
 	}
 	var err error
 	if dnsCfg.NameServer, err = parseNameServer(cfg.NameServer, cfg.RespectRules, cfg.PreferH3); err != nil {
