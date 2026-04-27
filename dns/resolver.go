@@ -28,6 +28,7 @@ type dnsClient interface {
 type dnsCache interface {
 	GetWithExpire(key string) (*D.Msg, time.Time, bool)
 	SetWithExpire(key string, value *D.Msg, expire time.Time)
+	Exist(key string) bool
 	Clear()
 }
 
@@ -58,6 +59,7 @@ type Resolver struct {
 	optimisticCacheAnswerTTL uint32
 	minTTL                   uint32
 	maxTTL                   uint32
+	prefetch                 *prefetchManager
 }
 
 func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
@@ -168,10 +170,9 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 	if len(m.Question) == 0 {
 		return nil, errors.New("should have one question at least")
 	}
-	continueFetch := false
 	cacheFailure := true
 	defer func() {
-		if continueFetch || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
 				defer cancel()
@@ -197,10 +198,19 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 			}
 			r.stats.recordCacheHit(true)
 			setMsgTTL(msg, r.optimisticCacheAnswerTTL) // Continue fetch
-			continueFetch = true
 			cacheFailure = false
+			r.markPrefetchClientRefresh(q.String())
+			if done := r.tryStartRefresh(q.String()); done != nil {
+				go func() {
+					defer done()
+					ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
+					defer cancel()
+					_, _ = r.exchangeWithoutCache(ctx, m, cacheFailure)
+				}()
+			}
 		} else {
 			r.stats.recordCacheHit(false)
+			r.markPrefetchNearExpiryHit(q.String(), expireTime, now)
 			// updating TTL by subtracting common delta time from each DNS record
 			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
 			clampMsgTTL(msg, r.minTTL, r.maxTTL)
@@ -239,7 +249,8 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg, cacheFail
 			}
 
 			if cache {
-				putMsgToCache(r.cache, q, result, r.minTTL, r.maxTTL, cacheFailure)
+				meta := putMsgToCache(r.cache, q, result, r.minTTL, r.maxTTL, cacheFailure)
+				r.updatePrefetchMeta(meta)
 			}
 		}()
 
@@ -423,6 +434,9 @@ func (r *Resolver) Invalid() bool {
 func (r *Resolver) ClearCache() {
 	if r != nil && r.cache != nil {
 		r.cache.Clear()
+		if r.prefetch != nil {
+			r.prefetch.clear()
+		}
 	}
 }
 
@@ -441,6 +455,9 @@ func (r *Resolver) StoreDNSCache() {
 func (r *Resolver) CloseDNSCache() {
 	if r == nil {
 		return
+	}
+	if r.prefetch != nil {
+		r.prefetch.stopLoop()
 	}
 	if cache, ok := r.cache.(interface{ Close() }); ok {
 		cache.Close()
@@ -529,6 +546,10 @@ type Config struct {
 	OptimisticCacheAnswerTTL int
 	MinTTL                   uint32
 	MaxTTL                   uint32
+	Prefetch                 bool
+	PrefetchScanInterval     int
+	PrefetchThreshold        int
+	PrefetchMinRefreshes     int
 	PersistCache             bool
 }
 
@@ -567,6 +588,16 @@ func (config Config) optimisticCacheAnswerTTL() uint32 {
 		return defaultOptimisticCacheAnswerTTL
 	}
 	return uint32(config.OptimisticCacheAnswerTTL)
+}
+
+func (config Config) effectiveMinTTL() uint32 {
+	if config.MinTTL > 0 {
+		return config.MinTTL
+	}
+	if config.Prefetch {
+		return defaultPrefetchMinTTL
+	}
+	return 0
 }
 
 type Resolvers struct {
@@ -622,17 +653,19 @@ func (rs Resolvers) ResetDNSStats() {
 func NewResolver(config Config) (rs Resolvers) {
 	optimisticCacheTTL := config.optimisticCacheTTL()
 	optimisticCacheAnswerTTL := config.optimisticCacheAnswerTTL()
+	minTTL := config.effectiveMinTTL()
 	defaultResolver := &Resolver{
 		main:        transform(config.Default, nil),
 		cache:       config.newCache("default"),
 		stats:       newDNSStats(),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
-		minTTL:      config.MinTTL,
+		minTTL:      minTTL,
 		maxTTL:      config.MaxTTL,
 	}
 	defaultResolver.optimisticCache = config.OptimisticCache
 	defaultResolver.optimisticCacheTTL = optimisticCacheTTL
 	defaultResolver.optimisticCacheAnswerTTL = optimisticCacheAnswerTTL
+	defaultResolver.initPrefetch(config)
 
 	var nameServerCache []struct {
 		NameServer
@@ -695,13 +728,14 @@ func NewResolver(config Config) (rs Resolvers) {
 		stats:       newDNSStats(),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 		policy:      makePolicy(config.Policy),
-		minTTL:      config.MinTTL,
+		minTTL:      minTTL,
 		maxTTL:      config.MaxTTL,
 	}
 	r.optimisticCache = config.OptimisticCache
 	r.optimisticCacheTTL = optimisticCacheTTL
 	r.optimisticCacheAnswerTTL = optimisticCacheAnswerTTL
 	r.defaultResolver = defaultResolver
+	r.initPrefetch(config)
 	rs.Resolver = r
 
 	if len(config.ProxyServer) != 0 {
@@ -712,12 +746,13 @@ func NewResolver(config Config) (rs Resolvers) {
 			stats:       newDNSStats(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 			policy:      makePolicy(config.ProxyServerPolicy),
-			minTTL:      config.MinTTL,
+			minTTL:      minTTL,
 			maxTTL:      config.MaxTTL,
 		}
 		rs.ProxyResolver.optimisticCache = config.OptimisticCache
 		rs.ProxyResolver.optimisticCacheTTL = optimisticCacheTTL
 		rs.ProxyResolver.optimisticCacheAnswerTTL = optimisticCacheAnswerTTL
+		rs.ProxyResolver.initPrefetch(config)
 	}
 
 	if len(config.DirectServer) != 0 {
@@ -727,12 +762,13 @@ func NewResolver(config Config) (rs Resolvers) {
 			cache:       config.newCache("direct"),
 			stats:       newDNSStats(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
-			minTTL:      config.MinTTL,
+			minTTL:      minTTL,
 			maxTTL:      config.MaxTTL,
 		}
 		rs.DirectResolver.optimisticCache = config.OptimisticCache
 		rs.DirectResolver.optimisticCacheTTL = optimisticCacheTTL
 		rs.DirectResolver.optimisticCacheAnswerTTL = optimisticCacheAnswerTTL
+		rs.DirectResolver.initPrefetch(config)
 		if config.DirectFollowPolicy {
 			rs.DirectResolver.policy = r.policy
 		}

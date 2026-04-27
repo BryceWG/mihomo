@@ -162,6 +162,10 @@ type DNS struct {
 	OptimisticCache          bool
 	OptimisticCacheTTL       int
 	OptimisticCacheAnswerTTL int
+	Prefetch                 bool
+	PrefetchScanInterval     int
+	PrefetchThreshold        int
+	PrefetchMinRefreshes     int
 	MinTTL                   uint32
 	MaxTTL                   uint32
 	FakeIPRange              netip.Prefix
@@ -245,6 +249,10 @@ type RawDNS struct {
 	OptimisticCache              bool                                `yaml:"optimistic-cache" json:"optimistic-cache"`
 	OptimisticCacheTTL           int                                 `yaml:"optimistic-cache-ttl" json:"optimistic-cache-ttl"`
 	OptimisticCacheAnswerTTL     int                                 `yaml:"optimistic-cache-answer-ttl" json:"optimistic-cache-answer-ttl"`
+	Prefetch                     bool                                `yaml:"prefetch" json:"prefetch"`
+	PrefetchScanInterval         int                                 `yaml:"prefetch-scan-interval" json:"prefetch-scan-interval"`
+	PrefetchThreshold            int                                 `yaml:"prefetch-threshold" json:"prefetch-threshold"`
+	PrefetchMinRefreshes         int                                 `yaml:"prefetch-min-refreshes" json:"prefetch-min-refreshes"`
 	MinTTL                       uint32                              `yaml:"min-ttl" json:"min-ttl"`
 	MaxTTL                       uint32                              `yaml:"max-ttl" json:"max-ttl"`
 	NameServerPolicy             *orderedmap.OrderedMap[string, any] `yaml:"nameserver-policy" json:"nameserver-policy"`
@@ -1399,21 +1407,34 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 	if cfg.OptimisticCacheAnswerTTL < 0 {
 		return nil, fmt.Errorf("dns optimistic-cache-answer-ttl should be greater than or equal to 0")
 	}
+	if cfg.PrefetchScanInterval < 0 {
+		return nil, fmt.Errorf("dns prefetch-scan-interval should be greater than or equal to 0")
+	}
+	if cfg.PrefetchThreshold < 0 {
+		return nil, fmt.Errorf("dns prefetch-threshold should be greater than or equal to 0")
+	}
+	if cfg.PrefetchMinRefreshes < 0 {
+		return nil, fmt.Errorf("dns prefetch-min-refreshes should be greater than or equal to 0")
+	}
 
 	dnsCfg := &DNS{
-		Enable:            cfg.Enable,
-		Listen:            cfg.Listen,
-		PreferH3:          cfg.PreferH3,
-		IPv6Timeout:       cfg.IPv6Timeout,
-		IPv6:              cfg.IPv6,
-		UseHosts:          cfg.UseHosts,
-		UseSystemHosts:    cfg.UseSystemHosts,
-		EnhancedMode:      cfg.EnhancedMode,
-		CacheAlgorithm:    cfg.CacheAlgorithm,
-		CacheMaxSize:      cfg.CacheMaxSize,
-		CacheSaveInterval: cfg.CacheSaveInterval,
-		MinTTL:            cfg.MinTTL,
-		MaxTTL:            cfg.MaxTTL,
+		Enable:               cfg.Enable,
+		Listen:               cfg.Listen,
+		PreferH3:             cfg.PreferH3,
+		IPv6Timeout:          cfg.IPv6Timeout,
+		IPv6:                 cfg.IPv6,
+		UseHosts:             cfg.UseHosts,
+		UseSystemHosts:       cfg.UseSystemHosts,
+		EnhancedMode:         cfg.EnhancedMode,
+		CacheAlgorithm:       cfg.CacheAlgorithm,
+		CacheMaxSize:         cfg.CacheMaxSize,
+		CacheSaveInterval:    cfg.CacheSaveInterval,
+		Prefetch:             cfg.Prefetch,
+		PrefetchScanInterval: cfg.PrefetchScanInterval,
+		PrefetchThreshold:    cfg.PrefetchThreshold,
+		PrefetchMinRefreshes: cfg.PrefetchMinRefreshes,
+		MinTTL:               cfg.MinTTL,
+		MaxTTL:               cfg.MaxTTL,
 	}
 	dnsCfg.OptimisticCache = cfg.OptimisticCache
 	dnsCfg.OptimisticCacheTTL = cfg.OptimisticCacheTTL

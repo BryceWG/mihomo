@@ -135,6 +135,15 @@ func (a *ARC[K, V]) GetWithExpire(key K) (V, time.Time, bool) {
 	return ent.value, time.Unix(ent.expires, 0), true
 }
 
+// Exist returns if key exist in cache without updating replacement state.
+func (a *ARC[K, V]) Exist(key K) bool {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	ent, ok := a.cache[key]
+	return ok && !ent.ghost
+}
+
 // Len determines the number of currently cached entries.
 // This method is side-effect free in the sense that it does not attempt to optimize random cache access.
 func (a *ARC[K, V]) Len() int {

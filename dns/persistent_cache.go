@@ -14,9 +14,12 @@ import (
 const dnsCacheStoreInterval = 5 * time.Minute
 
 type persistentCacheRecord struct {
-	msg    *D.Msg
-	expire time.Time
-	elem   *list.Element
+	msg          *D.Msg
+	expire       time.Time
+	originalTTL  time.Duration
+	cachedAt     time.Time
+	refreshCount int32
+	elem         *list.Element
 }
 
 type persistentDNSCache struct {
@@ -73,7 +76,20 @@ func (c *persistentDNSCache) SetWithExpire(key string, value *D.Msg, expire time
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.setRecordLocked(key, value, expire)
+	c.setRecordLocked(key, value, expire, deriveDNSCacheMeta(key, value, expire))
+	c.dirty = true
+}
+
+func (c *persistentDNSCache) SetWithExpireMeta(key string, value *D.Msg, expire time.Time, meta dnsCacheMeta) {
+	c.dnsCache.SetWithExpire(key, value, expire)
+	if value == nil {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.setRecordLocked(key, value, expire, meta)
 	c.dirty = true
 }
 
@@ -125,8 +141,23 @@ func (c *persistentDNSCache) restore() {
 			continue
 		}
 
+		meta := dnsCacheMeta{
+			key:          key,
+			cachedAt:     record.CachedAt,
+			expire:       record.Expire,
+			originalTTL:  record.OriginalTTL,
+			refreshCount: record.RefreshCount,
+		}
+		if len(msg.Question) > 0 {
+			meta.question = msg.Question[0]
+		}
+		if meta.cachedAt.IsZero() || meta.originalTTL <= 0 || meta.question.Name == "" {
+			meta = deriveDNSCacheMeta(key, msg, record.Expire)
+			meta.refreshCount = record.RefreshCount
+		}
+
 		c.dnsCache.SetWithExpire(key, msg, record.Expire)
-		c.setRecordLocked(key, msg, record.Expire)
+		c.setRecordLocked(key, msg, record.Expire, meta)
 		restored++
 	}
 	log.Infoln("[DNS] persistent cache restored for %s, restored: %d, expired skipped: %d", c.namespace, restored, expired)
@@ -154,19 +185,29 @@ func (c *persistentDNSCache) storeLoop() {
 	}
 }
 
-func (c *persistentDNSCache) setRecordLocked(key string, msg *D.Msg, expire time.Time) {
+func (c *persistentDNSCache) setRecordLocked(key string, msg *D.Msg, expire time.Time, meta dnsCacheMeta) {
+	if meta.cachedAt.IsZero() || meta.originalTTL <= 0 {
+		meta = deriveDNSCacheMeta(key, msg, expire)
+	}
+
 	if record, ok := c.records[key]; ok {
 		record.msg = msg.Copy()
 		record.expire = expire
+		record.originalTTL = meta.originalTTL
+		record.cachedAt = meta.cachedAt
+		record.refreshCount = meta.refreshCount
 		c.order.MoveToBack(record.elem)
 		return
 	}
 
 	elem := c.order.PushBack(key)
 	c.records[key] = &persistentCacheRecord{
-		msg:    msg.Copy(),
-		expire: expire,
-		elem:   elem,
+		msg:          msg.Copy(),
+		expire:       expire,
+		originalTTL:  meta.originalTTL,
+		cachedAt:     meta.cachedAt,
+		refreshCount: meta.refreshCount,
+		elem:         elem,
 	}
 	c.trimLocked()
 }
@@ -193,6 +234,41 @@ func (c *persistentDNSCache) touch(key string) {
 
 	if record, ok := c.records[key]; ok {
 		c.order.MoveToBack(record.elem)
+	}
+}
+
+func (c *persistentDNSCache) PrefetchMetadata() map[string]dnsCacheMeta {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	metadata := make(map[string]dnsCacheMeta, len(c.records))
+	for key, record := range c.records {
+		meta := dnsCacheMeta{
+			key:          key,
+			expire:       record.expire,
+			originalTTL:  record.originalTTL,
+			cachedAt:     record.cachedAt,
+			refreshCount: record.refreshCount,
+		}
+		if len(record.msg.Question) > 0 {
+			meta.question = record.msg.Question[0]
+		}
+		if meta.cachedAt.IsZero() || meta.originalTTL <= 0 || meta.question.Name == "" {
+			meta = deriveDNSCacheMeta(key, record.msg, record.expire)
+			meta.refreshCount = record.refreshCount
+		}
+		metadata[key] = meta
+	}
+	return metadata
+}
+
+func (c *persistentDNSCache) SetPrefetchRefreshCount(key string, count int32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if record, ok := c.records[key]; ok {
+		record.refreshCount = count
+		c.dirty = true
 	}
 }
 
@@ -223,10 +299,45 @@ func (c *persistentDNSCache) snapshot() map[string]cachefile.DNSCacheRecord {
 		}
 
 		snapshot[key] = cachefile.DNSCacheRecord{
-			Msg:    payload,
-			Expire: record.expire,
+			Msg:          payload,
+			Expire:       record.expire,
+			OriginalTTL:  record.originalTTL,
+			CachedAt:     record.cachedAt,
+			RefreshCount: record.refreshCount,
 		}
 	}
 	c.dirty = false
 	return snapshot
+}
+
+func deriveDNSCacheMeta(key string, msg *D.Msg, expire time.Time) dnsCacheMeta {
+	ttl := minimalTTL(loConcatDNSRecords(msg))
+	if ttl == 0 && expire.After(time.Now()) {
+		ttl = uint32(time.Until(expire).Seconds())
+	}
+	if ttl == 0 {
+		ttl = 1
+	}
+
+	meta := dnsCacheMeta{
+		key:         key,
+		expire:      expire,
+		originalTTL: time.Duration(ttl) * time.Second,
+		cachedAt:    expire.Add(-time.Duration(ttl) * time.Second),
+	}
+	if msg != nil && len(msg.Question) > 0 {
+		meta.question = msg.Question[0]
+	}
+	return meta
+}
+
+func loConcatDNSRecords(msg *D.Msg) []D.RR {
+	if msg == nil {
+		return nil
+	}
+	records := make([]D.RR, 0, len(msg.Answer)+len(msg.Ns)+len(msg.Extra))
+	records = append(records, msg.Answer...)
+	records = append(records, msg.Ns...)
+	records = append(records, msg.Extra...)
+	return records
 }

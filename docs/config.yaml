@@ -247,6 +247,10 @@ dns:
   # optimistic-cache: false # 启用后，缓存过期时先返回旧结果并异步刷新
   # optimistic-cache-ttl: 3600 # 单位：秒，过期后允许继续返回旧缓存的最长时间
   # optimistic-cache-answer-ttl: 1 # 单位：秒，返回旧缓存时写入响应的 TTL
+  # prefetch: false # 启用后，热门缓存记录会在过期前由后台主动刷新
+  # prefetch-scan-interval: 5 # 单位：秒，后台扫描即将过期热门记录的间隔
+  # prefetch-threshold: 30 # 单位：秒，缓存剩余 TTL 小于该值时触发预取
+  # prefetch-min-refreshes: 2 # 客户端跨 TTL 周期触发刷新或临期命中的次数阈值
   # min-ttl: 0 # 秒，0 表示不覆盖
   # max-ttl: 0 # 秒，0 表示不覆盖
   enable: false # 关闭将使用系统 DNS

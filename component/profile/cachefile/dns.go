@@ -20,8 +20,11 @@ var (
 )
 
 type DNSCacheRecord struct {
-	Msg    []byte
-	Expire time.Time
+	Msg          []byte
+	Expire       time.Time
+	OriginalTTL  time.Duration
+	CachedAt     time.Time
+	RefreshCount int32
 }
 
 type DNSCacheFile struct {

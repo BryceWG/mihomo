@@ -25,6 +25,15 @@ const (
 
 const serverFailureCacheTTL uint32 = 5
 
+type dnsCacheMeta struct {
+	key          string
+	question     D.Question
+	cachedAt     time.Time
+	expire       time.Time
+	originalTTL  time.Duration
+	refreshCount int32
+}
+
 func minimalTTL(records []D.RR) uint32 {
 	rr := lo.MinBy(records, func(r1 D.RR, r2 D.RR) bool {
 		return r1.Header().Ttl < r2.Header().Ttl
@@ -86,11 +95,11 @@ func getMsgFromCache(c dnsCache, q D.Question) (*D.Msg, time.Time, bool) {
 
 // putMsgToCache puts a dns message into the cache.
 // the msg is copied before being stored in the cache, so it can be modified without affecting the original msg.
-func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg, minTTL, maxTTL uint32, cacheFailure bool) {
+func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg, minTTL, maxTTL uint32, cacheFailure bool) *dnsCacheMeta {
 	// skip dns cache for acme challenge
 	if q.Qtype == D.TypeTXT && strings.HasPrefix(q.Name, "_acme-challenge.") {
 		log.Debugln("[DNS] dns cache ignored because of acme challenge for: %s", q.Name)
-		return
+		return nil
 	}
 
 	msg = msg.Copy() // never modify the original msg
@@ -104,7 +113,7 @@ func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg, minTTL, maxTTL uint32, 
 	var ttl uint32
 	if msg.Rcode == D.RcodeServerFailure {
 		if !cacheFailure {
-			return
+			return nil
 		}
 		// [...] a resolver MAY cache a server failure response.
 		// If it does so it MUST NOT cache it for longer than five (5) minutes [...]
@@ -113,10 +122,26 @@ func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg, minTTL, maxTTL uint32, 
 		ttl = minimalTTL(lo.Concat(msg.Answer, msg.Ns, msg.Extra))
 	}
 	if ttl == 0 {
-		return
+		return nil
 	}
 
-	c.SetWithExpire(q.String(), msg, time.Now().Add(time.Duration(ttl)*time.Second))
+	now := time.Now()
+	expire := time.Unix(now.Add(time.Duration(ttl)*time.Second).Unix(), 0)
+	meta := &dnsCacheMeta{
+		key:         q.String(),
+		question:    q,
+		cachedAt:    now,
+		expire:      expire,
+		originalTTL: time.Duration(ttl) * time.Second,
+	}
+	if cache, ok := c.(interface {
+		SetWithExpireMeta(string, *D.Msg, time.Time, dnsCacheMeta)
+	}); ok {
+		cache.SetWithExpireMeta(meta.key, msg, meta.expire, *meta)
+	} else {
+		c.SetWithExpire(meta.key, msg, meta.expire)
+	}
+	return meta
 }
 
 func setMsgTTL(msg *D.Msg, ttl uint32) {
