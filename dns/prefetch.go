@@ -578,6 +578,7 @@ func (p *prefetchManager) doPrefetch(entry *prefetchEntry) {
 	p.recordPrefetchSuccess(entry)
 	p.applyDecay(entry)
 	p.resolver.stats.recordPrefetch(true)
+	log.Debugln("[DNS] prefetch %s success", question.String())
 }
 
 func (p *prefetchManager) prefetchUpdatedCache(question D.Question, oldExpire time.Time) bool {
