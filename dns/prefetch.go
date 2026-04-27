@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,8 @@ const (
 	defaultPrefetchDecay        = int32(1)
 	defaultPrefetchConcurrency  = 10
 	defaultPrefetchMinTTL       = 120
+	defaultPrefetchBackoffBase  = 30 * time.Second
+	defaultPrefetchBackoffMax   = 5 * time.Minute
 )
 
 type prefetchConfig struct {
@@ -40,6 +43,8 @@ type prefetchEntry struct {
 	expire               time.Time
 	originalTTL          time.Duration
 	observedWindowExpire time.Time
+	prefetchFailureCount int32
+	nextPrefetchAttempt  time.Time
 
 	refreshCount atomic.Int32
 	inFlight     atomic.Bool
@@ -309,6 +314,10 @@ func (p *prefetchManager) shouldPrefetch(entry *prefetchEntry, now time.Time) bo
 	}
 
 	entry.mu.Lock()
+	if !entry.nextPrefetchAttempt.IsZero() && now.Before(entry.nextPrefetchAttempt) {
+		entry.mu.Unlock()
+		return false
+	}
 	expire := entry.expire
 	question := entry.question
 	entry.mu.Unlock()
@@ -334,6 +343,63 @@ func (p *prefetchManager) shouldPrefetch(entry *prefetchEntry, now time.Time) bo
 	return true
 }
 
+func (p *prefetchManager) recordPrefetchFailure(entry *prefetchEntry, now time.Time) {
+	entry.mu.Lock()
+	entry.prefetchFailureCount++
+	failureCount := entry.prefetchFailureCount
+	entry.nextPrefetchAttempt = now.Add(p.prefetchFailureBackoff(entry.key, failureCount))
+	entry.mu.Unlock()
+}
+
+func (p *prefetchManager) recordPrefetchSuccess(entry *prefetchEntry) {
+	entry.mu.Lock()
+	entry.prefetchFailureCount = 0
+	entry.nextPrefetchAttempt = time.Time{}
+	entry.mu.Unlock()
+}
+
+func (p *prefetchManager) prefetchFailureBackoff(key string, failureCount int32) time.Duration {
+	backoff := p.config.scanInterval * 2
+	if backoff < defaultPrefetchBackoffBase {
+		backoff = defaultPrefetchBackoffBase
+	}
+
+	if failureCount > 1 {
+		for i := int32(1); i < failureCount && backoff < defaultPrefetchBackoffMax; i++ {
+			backoff *= 2
+		}
+	}
+	if backoff > defaultPrefetchBackoffMax {
+		backoff = defaultPrefetchBackoffMax
+	}
+
+	jitterWindow := p.config.scanInterval
+	if jitterWindow <= 0 {
+		jitterWindow = defaultPrefetchScanInterval
+	}
+	if maxJitter := backoff / 4; jitterWindow > maxJitter {
+		jitterWindow = maxJitter
+	}
+	if jitterWindow <= 0 {
+		return backoff
+	}
+	if backoff > defaultPrefetchBackoffMax-jitterWindow {
+		backoff = defaultPrefetchBackoffMax - jitterWindow
+	}
+
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(key))
+	_, _ = hasher.Write([]byte{byte(failureCount), byte(failureCount >> 8), byte(failureCount >> 16), byte(failureCount >> 24)})
+	backoff += time.Duration(hasher.Sum64() % uint64(jitterWindow))
+	if backoff < defaultPrefetchBackoffBase {
+		return defaultPrefetchBackoffBase
+	}
+	if backoff > defaultPrefetchBackoffMax {
+		return defaultPrefetchBackoffMax
+	}
+	return backoff
+}
+
 func (p *prefetchManager) doPrefetch(entry *prefetchEntry) {
 	entry.mu.Lock()
 	question := entry.question
@@ -350,6 +416,7 @@ func (p *prefetchManager) doPrefetch(entry *prefetchEntry) {
 	start := time.Now()
 	resp, err := p.resolver.exchangeWithoutCache(ctx, msg, false)
 	if err != nil || resp == nil || resp.Rcode == D.RcodeServerFailure {
+		p.recordPrefetchFailure(entry, time.Now())
 		p.resolver.stats.recordPrefetch(false)
 		log.Debugln("[DNS] prefetch %s failed: %v", question.String(), err)
 		return
@@ -359,10 +426,12 @@ func (p *prefetchManager) doPrefetch(entry *prefetchEntry) {
 	refreshed := entry.cachedAt.After(oldCachedAt) && !entry.cachedAt.Before(start)
 	entry.mu.Unlock()
 	if !refreshed {
+		p.recordPrefetchFailure(entry, time.Now())
 		p.resolver.stats.recordPrefetch(false)
 		return
 	}
 
+	p.recordPrefetchSuccess(entry)
 	p.applyDecay(entry)
 	p.resolver.stats.recordPrefetch(true)
 }
