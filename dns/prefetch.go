@@ -222,6 +222,14 @@ func (p *prefetchManager) markClientRefresh(key string) {
 	if entry == nil {
 		return
 	}
+	entry.mu.Lock()
+	if entry.observedWindowExpire.Equal(entry.expire) {
+		entry.mu.Unlock()
+		return
+	}
+	entry.observedWindowExpire = entry.expire
+	entry.mu.Unlock()
+
 	p.addRefreshCount(entry, 1)
 }
 
