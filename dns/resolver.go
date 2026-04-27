@@ -631,14 +631,12 @@ func (rs Resolvers) CloseDNSCache() {
 }
 
 func (rs Resolvers) DNSStats() DNSStatsSnapshot {
-	stats := newDNSStats()
-	stats.addSnapshot(rs.Resolver.DNSStats())
+	snapshots := []DNSStatsSnapshot{rs.Resolver.DNSStats()}
 	if rs.Resolver != nil {
-		stats.addSnapshot(rs.Resolver.defaultResolver.DNSStats())
+		snapshots = append(snapshots, rs.Resolver.defaultResolver.DNSStats())
 	}
-	stats.addSnapshot(rs.ProxyResolver.DNSStats())
-	stats.addSnapshot(rs.DirectResolver.DNSStats())
-	return stats.snapshot()
+	snapshots = append(snapshots, rs.ProxyResolver.DNSStats(), rs.DirectResolver.DNSStats())
+	return combineDNSStatsSnapshots(snapshots...)
 }
 
 func (rs Resolvers) ResetDNSStats() {
