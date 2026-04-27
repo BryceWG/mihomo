@@ -36,19 +36,27 @@ type result struct {
 	Error error
 }
 
+const (
+	defaultOptimisticCacheTTL       = time.Hour
+	defaultOptimisticCacheAnswerTTL = 1
+)
+
 type Resolver struct {
-	ipv6                  bool
-	ipv6Timeout           time.Duration
-	main                  []dnsClient
-	fallback              []dnsClient
-	fallbackDomainFilters []C.DomainMatcher
-	fallbackIPFilters     []C.IpMatcher
-	group                 singleflight.Group[*D.Msg]
-	cache                 dnsCache
-	policy                []dnsPolicy
-	defaultResolver       *Resolver
-	minTTL                uint32
-	maxTTL                uint32
+	ipv6                     bool
+	ipv6Timeout              time.Duration
+	main                     []dnsClient
+	fallback                 []dnsClient
+	fallbackDomainFilters    []C.DomainMatcher
+	fallbackIPFilters        []C.IpMatcher
+	group                    singleflight.Group[*D.Msg]
+	cache                    dnsCache
+	policy                   []dnsPolicy
+	defaultResolver          *Resolver
+	optimisticCache          bool
+	optimisticCacheTTL       time.Duration
+	optimisticCacheAnswerTTL uint32
+	minTTL                   uint32
+	maxTTL                   uint32
 }
 
 func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
@@ -155,12 +163,13 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 		return nil, errors.New("should have one question at least")
 	}
 	continueFetch := false
+	cacheFailure := true
 	defer func() {
 		if continueFetch || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
 				defer cancel()
-				_, _ = r.exchangeWithoutCache(ctx, m) // ignore result, just for putMsgToCache
+				_, _ = r.exchangeWithoutCache(ctx, m, cacheFailure) // ignore result, just for putMsgToCache
 			}()
 		}
 	}()
@@ -172,8 +181,16 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 		log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
 		now := time.Now()
 		if expireTime.Before(now) {
-			setMsgTTL(msg, uint32(1)) // Continue fetch
+			if !r.optimisticCacheAlive(msg, expireTime, now) {
+				msg, err = r.exchangeWithoutCache(ctx, m, true)
+				if msg != nil {
+					clampMsgTTL(msg, r.minTTL, r.maxTTL)
+				}
+				return
+			}
+			setMsgTTL(msg, r.optimisticCacheAnswerTTL) // Continue fetch
 			continueFetch = true
+			cacheFailure = false
 		} else {
 			// updating TTL by subtracting common delta time from each DNS record
 			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
@@ -181,15 +198,19 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 		}
 		return
 	}
-	msg, err = r.exchangeWithoutCache(ctx, m)
+	msg, err = r.exchangeWithoutCache(ctx, m, true)
 	if msg != nil {
 		clampMsgTTL(msg, r.minTTL, r.maxTTL)
 	}
 	return
 }
 
+func (r *Resolver) optimisticCacheAlive(msg *D.Msg, expireTime time.Time, now time.Time) bool {
+	return r.optimisticCache && r.optimisticCacheTTL > 0 && msg != nil && msg.Rcode != D.RcodeServerFailure && now.Before(expireTime.Add(r.optimisticCacheTTL))
+}
+
 // ExchangeWithoutCache a batch of dns request, and it do NOT GET from cache
-func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg, cacheFailure bool) (msg *D.Msg, err error) {
 	q := m.Question[0]
 
 	retryNum := 0
@@ -208,7 +229,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 			}
 
 			if cache {
-				putMsgToCache(r.cache, q, result, r.minTTL, r.maxTTL)
+				putMsgToCache(r.cache, q, result, r.minTTL, r.maxTTL, cacheFailure)
 			}
 		}()
 
@@ -465,23 +486,26 @@ type Policy struct {
 }
 
 type Config struct {
-	Main, Fallback       []NameServer
-	Default              []NameServer
-	ProxyServer          []NameServer
-	DirectServer         []NameServer
-	DirectFollowPolicy   bool
-	IPv6                 bool
-	IPv6Timeout          uint
-	FallbackIPFilter     []C.IpMatcher
-	FallbackDomainFilter []C.DomainMatcher
-	Policy               []Policy
-	ProxyServerPolicy    []Policy
-	CacheAlgorithm       string
-	CacheMaxSize         int
-	CacheSaveInterval    int
-	MinTTL               uint32
-	MaxTTL               uint32
-	PersistCache         bool
+	Main, Fallback           []NameServer
+	Default                  []NameServer
+	ProxyServer              []NameServer
+	DirectServer             []NameServer
+	DirectFollowPolicy       bool
+	IPv6                     bool
+	IPv6Timeout              uint
+	FallbackIPFilter         []C.IpMatcher
+	FallbackDomainFilter     []C.DomainMatcher
+	Policy                   []Policy
+	ProxyServerPolicy        []Policy
+	CacheAlgorithm           string
+	CacheMaxSize             int
+	CacheSaveInterval        int
+	OptimisticCache          bool
+	OptimisticCacheTTL       int
+	OptimisticCacheAnswerTTL int
+	MinTTL                   uint32
+	MaxTTL                   uint32
+	PersistCache             bool
 }
 
 func (config Config) newCache(namespace string) dnsCache {
@@ -496,9 +520,29 @@ func (config Config) newCache(namespace string) dnsCache {
 		cache = lru.New(lru.WithSize[string, *D.Msg](config.CacheMaxSize), lru.WithStale[string, *D.Msg](true))
 	}
 	if config.PersistCache {
-		cache = newPersistentDNSCache(namespace, cache, config.CacheMaxSize, time.Duration(config.CacheSaveInterval)*time.Second)
+		cache = newPersistentDNSCache(namespace, cache, config.CacheMaxSize, time.Duration(config.CacheSaveInterval)*time.Second, config.optimisticCacheTTL())
 	}
 	return cache
+}
+
+func (config Config) optimisticCacheTTL() time.Duration {
+	if !config.OptimisticCache {
+		return 0
+	}
+	if config.OptimisticCacheTTL == 0 {
+		return defaultOptimisticCacheTTL
+	}
+	return time.Duration(config.OptimisticCacheTTL) * time.Second
+}
+
+func (config Config) optimisticCacheAnswerTTL() uint32 {
+	if !config.OptimisticCache {
+		return 0
+	}
+	if config.OptimisticCacheAnswerTTL <= 0 {
+		return defaultOptimisticCacheAnswerTTL
+	}
+	return uint32(config.OptimisticCacheAnswerTTL)
 }
 
 type Resolvers struct {
@@ -532,6 +576,8 @@ func (rs Resolvers) CloseDNSCache() {
 }
 
 func NewResolver(config Config) (rs Resolvers) {
+	optimisticCacheTTL := config.optimisticCacheTTL()
+	optimisticCacheAnswerTTL := config.optimisticCacheAnswerTTL()
 	defaultResolver := &Resolver{
 		main:        transform(config.Default, nil),
 		cache:       config.newCache("default"),
@@ -539,6 +585,9 @@ func NewResolver(config Config) (rs Resolvers) {
 		minTTL:      config.MinTTL,
 		maxTTL:      config.MaxTTL,
 	}
+	defaultResolver.optimisticCache = config.OptimisticCache
+	defaultResolver.optimisticCacheTTL = optimisticCacheTTL
+	defaultResolver.optimisticCacheAnswerTTL = optimisticCacheAnswerTTL
 
 	var nameServerCache []struct {
 		NameServer
@@ -603,6 +652,9 @@ func NewResolver(config Config) (rs Resolvers) {
 		minTTL:      config.MinTTL,
 		maxTTL:      config.MaxTTL,
 	}
+	r.optimisticCache = config.OptimisticCache
+	r.optimisticCacheTTL = optimisticCacheTTL
+	r.optimisticCacheAnswerTTL = optimisticCacheAnswerTTL
 	r.defaultResolver = defaultResolver
 	rs.Resolver = r
 
@@ -616,6 +668,9 @@ func NewResolver(config Config) (rs Resolvers) {
 			minTTL:      config.MinTTL,
 			maxTTL:      config.MaxTTL,
 		}
+		rs.ProxyResolver.optimisticCache = config.OptimisticCache
+		rs.ProxyResolver.optimisticCacheTTL = optimisticCacheTTL
+		rs.ProxyResolver.optimisticCacheAnswerTTL = optimisticCacheAnswerTTL
 	}
 
 	if len(config.DirectServer) != 0 {
@@ -627,6 +682,9 @@ func NewResolver(config Config) (rs Resolvers) {
 			minTTL:      config.MinTTL,
 			maxTTL:      config.MaxTTL,
 		}
+		rs.DirectResolver.optimisticCache = config.OptimisticCache
+		rs.DirectResolver.optimisticCacheTTL = optimisticCacheTTL
+		rs.DirectResolver.optimisticCacheAnswerTTL = optimisticCacheAnswerTTL
 		if config.DirectFollowPolicy {
 			rs.DirectResolver.policy = r.policy
 		}

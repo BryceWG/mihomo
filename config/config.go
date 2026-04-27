@@ -143,35 +143,38 @@ type NTP struct {
 
 // DNS config
 type DNS struct {
-	Enable                bool
-	PreferH3              bool
-	IPv6                  bool
-	IPv6Timeout           uint
-	UseHosts              bool
-	UseSystemHosts        bool
-	NameServer            []dns.NameServer
-	Fallback              []dns.NameServer
-	FallbackIPFilter      []C.IpMatcher
-	FallbackDomainFilter  []C.DomainMatcher
-	Listen                string
-	EnhancedMode          C.DNSMode
-	DefaultNameserver     []dns.NameServer
-	CacheAlgorithm        string
-	CacheMaxSize          int
-	CacheSaveInterval     int
-	MinTTL                uint32
-	MaxTTL                uint32
-	FakeIPRange           netip.Prefix
-	FakeIPPool            *fakeip.Pool
-	FakeIPRange6          netip.Prefix
-	FakeIPPool6           *fakeip.Pool
-	FakeIPSkipper         *fakeip.Skipper
-	FakeIPTTL             int
-	NameServerPolicy      []dns.Policy
-	ProxyServerNameserver []dns.NameServer
-	ProxyServerPolicy     []dns.Policy
-	DirectNameServer      []dns.NameServer
-	DirectFollowPolicy    bool
+	Enable                   bool
+	PreferH3                 bool
+	IPv6                     bool
+	IPv6Timeout              uint
+	UseHosts                 bool
+	UseSystemHosts           bool
+	NameServer               []dns.NameServer
+	Fallback                 []dns.NameServer
+	FallbackIPFilter         []C.IpMatcher
+	FallbackDomainFilter     []C.DomainMatcher
+	Listen                   string
+	EnhancedMode             C.DNSMode
+	DefaultNameserver        []dns.NameServer
+	CacheAlgorithm           string
+	CacheMaxSize             int
+	CacheSaveInterval        int
+	OptimisticCache          bool
+	OptimisticCacheTTL       int
+	OptimisticCacheAnswerTTL int
+	MinTTL                   uint32
+	MaxTTL                   uint32
+	FakeIPRange              netip.Prefix
+	FakeIPPool               *fakeip.Pool
+	FakeIPRange6             netip.Prefix
+	FakeIPPool6              *fakeip.Pool
+	FakeIPSkipper            *fakeip.Skipper
+	FakeIPTTL                int
+	NameServerPolicy         []dns.Policy
+	ProxyServerNameserver    []dns.NameServer
+	ProxyServerPolicy        []dns.Policy
+	DirectNameServer         []dns.NameServer
+	DirectFollowPolicy       bool
 }
 
 // Profile config
@@ -239,6 +242,9 @@ type RawDNS struct {
 	CacheAlgorithm               string                              `yaml:"cache-algorithm" json:"cache-algorithm"`
 	CacheMaxSize                 int                                 `yaml:"cache-max-size" json:"cache-max-size"`
 	CacheSaveInterval            int                                 `yaml:"cache-save-interval" json:"cache-save-interval"`
+	OptimisticCache              bool                                `yaml:"optimistic-cache" json:"optimistic-cache"`
+	OptimisticCacheTTL           int                                 `yaml:"optimistic-cache-ttl" json:"optimistic-cache-ttl"`
+	OptimisticCacheAnswerTTL     int                                 `yaml:"optimistic-cache-answer-ttl" json:"optimistic-cache-answer-ttl"`
 	MinTTL                       uint32                              `yaml:"min-ttl" json:"min-ttl"`
 	MaxTTL                       uint32                              `yaml:"max-ttl" json:"max-ttl"`
 	NameServerPolicy             *orderedmap.OrderedMap[string, any] `yaml:"nameserver-policy" json:"nameserver-policy"`
@@ -1387,6 +1393,12 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 	if cfg.MinTTL > 0 && cfg.MaxTTL > 0 && cfg.MinTTL > cfg.MaxTTL {
 		return nil, fmt.Errorf("dns min-ttl should be less than or equal to max-ttl")
 	}
+	if cfg.OptimisticCacheTTL < 0 {
+		return nil, fmt.Errorf("dns optimistic-cache-ttl should be greater than or equal to 0")
+	}
+	if cfg.OptimisticCacheAnswerTTL < 0 {
+		return nil, fmt.Errorf("dns optimistic-cache-answer-ttl should be greater than or equal to 0")
+	}
 
 	dnsCfg := &DNS{
 		Enable:            cfg.Enable,
@@ -1403,6 +1415,9 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		MinTTL:            cfg.MinTTL,
 		MaxTTL:            cfg.MaxTTL,
 	}
+	dnsCfg.OptimisticCache = cfg.OptimisticCache
+	dnsCfg.OptimisticCacheTTL = cfg.OptimisticCacheTTL
+	dnsCfg.OptimisticCacheAnswerTTL = cfg.OptimisticCacheAnswerTTL
 	var err error
 	if dnsCfg.NameServer, err = parseNameServer(cfg.NameServer, cfg.RespectRules, cfg.PreferH3); err != nil {
 		return nil, err

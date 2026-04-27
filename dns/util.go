@@ -86,7 +86,7 @@ func getMsgFromCache(c dnsCache, q D.Question) (*D.Msg, time.Time, bool) {
 
 // putMsgToCache puts a dns message into the cache.
 // the msg is copied before being stored in the cache, so it can be modified without affecting the original msg.
-func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg, minTTL, maxTTL uint32) {
+func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg, minTTL, maxTTL uint32, cacheFailure bool) {
 	// skip dns cache for acme challenge
 	if q.Qtype == D.TypeTXT && strings.HasPrefix(q.Name, "_acme-challenge.") {
 		log.Debugln("[DNS] dns cache ignored because of acme challenge for: %s", q.Name)
@@ -103,6 +103,9 @@ func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg, minTTL, maxTTL uint32) 
 
 	var ttl uint32
 	if msg.Rcode == D.RcodeServerFailure {
+		if !cacheFailure {
+			return
+		}
 		// [...] a resolver MAY cache a server failure response.
 		// If it does so it MUST NOT cache it for longer than five (5) minutes [...]
 		ttl = serverFailureCacheTTL

@@ -24,6 +24,7 @@ type persistentDNSCache struct {
 	namespace string
 	maxSize   int
 	interval  time.Duration
+	staleTTL  time.Duration
 
 	mu      sync.Mutex
 	records map[string]*persistentCacheRecord
@@ -34,7 +35,7 @@ type persistentDNSCache struct {
 	done    chan struct{}
 }
 
-func newPersistentDNSCache(namespace string, cache dnsCache, maxSize int, interval time.Duration) *persistentDNSCache {
+func newPersistentDNSCache(namespace string, cache dnsCache, maxSize int, interval, staleTTL time.Duration) *persistentDNSCache {
 	if interval <= 0 {
 		interval = dnsCacheStoreInterval
 	}
@@ -43,6 +44,7 @@ func newPersistentDNSCache(namespace string, cache dnsCache, maxSize int, interv
 		namespace: namespace,
 		maxSize:   maxSize,
 		interval:  interval,
+		staleTTL:  staleTTL,
 		records:   map[string]*persistentCacheRecord{},
 		order:     list.New(),
 		stop:      make(chan struct{}),
@@ -112,7 +114,7 @@ func (c *persistentDNSCache) restore() {
 	restored := 0
 	expired := 0
 	for key, record := range cachefile.DNSCache().Load(c.namespace) {
-		if !record.Expire.After(now) {
+		if !c.cacheAlive(record.Expire, now) {
 			expired++
 			continue
 		}
@@ -128,6 +130,10 @@ func (c *persistentDNSCache) restore() {
 		restored++
 	}
 	log.Infoln("[DNS] persistent cache restored for %s, restored: %d, expired skipped: %d", c.namespace, restored, expired)
+}
+
+func (c *persistentDNSCache) cacheAlive(expire, now time.Time) bool {
+	return expire.After(now) || (c.staleTTL > 0 && now.Before(expire.Add(c.staleTTL)))
 }
 
 func (c *persistentDNSCache) storeLoop() {
@@ -204,7 +210,7 @@ func (c *persistentDNSCache) snapshot() map[string]cachefile.DNSCacheRecord {
 	now := time.Now()
 	snapshot := make(map[string]cachefile.DNSCacheRecord, len(c.records))
 	for key, record := range c.records {
-		if !record.expire.After(now) {
+		if !c.cacheAlive(record.expire, now) {
 			c.order.Remove(record.elem)
 			delete(c.records, key)
 			continue
