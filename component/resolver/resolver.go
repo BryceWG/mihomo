@@ -237,6 +237,18 @@ func ClearCache() {
 	go SystemResolver.ClearCache() // SystemResolver unneeded check nil
 }
 
+func StoreDNSCache() {
+	if resolver, ok := DefaultResolver.(interface{ StoreDNSCache() }); ok {
+		resolver.StoreDNSCache()
+	}
+}
+
+func CloseDNSCache() {
+	if resolver, ok := DefaultResolver.(interface{ CloseDNSCache() }); ok {
+		resolver.CloseDNSCache()
+	}
+}
+
 func ResetConnection() {
 	if DefaultResolver != nil {
 		go DefaultResolver.ResetConnection()

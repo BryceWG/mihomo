@@ -237,6 +237,8 @@ func updateNTP(c *config.NTP) {
 }
 
 func updateDNS(c *config.DNS, generalIPv6 bool) {
+	resolver.CloseDNSCache()
+
 	if !c.Enable {
 		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil
@@ -263,8 +265,10 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		DirectFollowPolicy:   c.DirectFollowPolicy,
 		CacheAlgorithm:       c.CacheAlgorithm,
 		CacheMaxSize:         c.CacheMaxSize,
+		CacheSaveInterval:    c.CacheSaveInterval,
 		MinTTL:               c.MinTTL,
 		MaxTTL:               c.MaxTTL,
+		PersistCache:         true,
 	})
 	m := dns.NewEnhancer(dns.EnhancerConfig{
 		IPv6:          ipv6,
@@ -537,6 +541,7 @@ func updateIPTables(cfg *config.Config) {
 func Shutdown() {
 	listener.Cleanup()
 	tproxy.CleanupTProxyIPTables()
+	resolver.CloseDNSCache()
 	resolver.StoreFakePoolState()
 
 	log.Warnln("Mihomo shutting down")

@@ -395,6 +395,30 @@ func (r *Resolver) ClearCache() {
 	}
 }
 
+func (r *Resolver) StoreDNSCache() {
+	if r == nil {
+		return
+	}
+	if cache, ok := r.cache.(interface{ Store() }); ok {
+		cache.Store()
+	}
+	if dr := r.defaultResolver; dr != nil {
+		dr.StoreDNSCache()
+	}
+}
+
+func (r *Resolver) CloseDNSCache() {
+	if r == nil {
+		return
+	}
+	if cache, ok := r.cache.(interface{ Close() }); ok {
+		cache.Close()
+	}
+	if dr := r.defaultResolver; dr != nil {
+		dr.CloseDNSCache()
+	}
+}
+
 func (r *Resolver) ResetConnection() {
 	if r != nil {
 		for _, c := range r.main {
@@ -454,20 +478,27 @@ type Config struct {
 	ProxyServerPolicy    []Policy
 	CacheAlgorithm       string
 	CacheMaxSize         int
+	CacheSaveInterval    int
 	MinTTL               uint32
 	MaxTTL               uint32
+	PersistCache         bool
 }
 
-func (config Config) newCache() dnsCache {
+func (config Config) newCache(namespace string) dnsCache {
 	if config.CacheMaxSize == 0 {
 		config.CacheMaxSize = 4096
 	}
+	var cache dnsCache
 	switch config.CacheAlgorithm {
 	case "arc":
-		return arc.New(arc.WithSize[string, *D.Msg](config.CacheMaxSize))
+		cache = arc.New(arc.WithSize[string, *D.Msg](config.CacheMaxSize))
 	default:
-		return lru.New(lru.WithSize[string, *D.Msg](config.CacheMaxSize), lru.WithStale[string, *D.Msg](true))
+		cache = lru.New(lru.WithSize[string, *D.Msg](config.CacheMaxSize), lru.WithStale[string, *D.Msg](true))
 	}
+	if config.PersistCache {
+		cache = newPersistentDNSCache(namespace, cache, config.CacheMaxSize, time.Duration(config.CacheSaveInterval)*time.Second)
+	}
+	return cache
 }
 
 type Resolvers struct {
@@ -488,10 +519,22 @@ func (rs Resolvers) ResetConnection() {
 	rs.DirectResolver.ResetConnection()
 }
 
+func (rs Resolvers) StoreDNSCache() {
+	rs.Resolver.StoreDNSCache()
+	rs.ProxyResolver.StoreDNSCache()
+	rs.DirectResolver.StoreDNSCache()
+}
+
+func (rs Resolvers) CloseDNSCache() {
+	rs.Resolver.CloseDNSCache()
+	rs.ProxyResolver.CloseDNSCache()
+	rs.DirectResolver.CloseDNSCache()
+}
+
 func NewResolver(config Config) (rs Resolvers) {
 	defaultResolver := &Resolver{
 		main:        transform(config.Default, nil),
-		cache:       config.newCache(),
+		cache:       config.newCache("default"),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 		minTTL:      config.MinTTL,
 		maxTTL:      config.MaxTTL,
@@ -554,7 +597,7 @@ func NewResolver(config Config) (rs Resolvers) {
 	r := &Resolver{
 		ipv6:        config.IPv6,
 		main:        cacheTransform(config.Main),
-		cache:       config.newCache(),
+		cache:       config.newCache("main"),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 		policy:      makePolicy(config.Policy),
 		minTTL:      config.MinTTL,
@@ -567,7 +610,7 @@ func NewResolver(config Config) (rs Resolvers) {
 		rs.ProxyResolver = &Resolver{
 			ipv6:        config.IPv6,
 			main:        cacheTransform(config.ProxyServer),
-			cache:       config.newCache(),
+			cache:       config.newCache("proxy"),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 			policy:      makePolicy(config.ProxyServerPolicy),
 			minTTL:      config.MinTTL,
@@ -579,7 +622,7 @@ func NewResolver(config Config) (rs Resolvers) {
 		rs.DirectResolver = &Resolver{
 			ipv6:        config.IPv6,
 			main:        cacheTransform(config.DirectServer),
-			cache:       config.newCache(),
+			cache:       config.newCache("direct"),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 			minTTL:      config.MinTTL,
 			maxTTL:      config.MaxTTL,

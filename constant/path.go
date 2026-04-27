@@ -170,6 +170,10 @@ func (p *path) Cache() string {
 	return P.Join(p.homeDir, "cache.db")
 }
 
+func (p *path) DNSCache() string {
+	return P.Join(p.homeDir, "dns-cache.db")
+}
+
 func (p *path) GeoIP() string {
 	files, err := os.ReadDir(p.homeDir)
 	if err != nil {

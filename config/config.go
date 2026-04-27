@@ -158,6 +158,7 @@ type DNS struct {
 	DefaultNameserver     []dns.NameServer
 	CacheAlgorithm        string
 	CacheMaxSize          int
+	CacheSaveInterval     int
 	MinTTL                uint32
 	MaxTTL                uint32
 	FakeIPRange           netip.Prefix
@@ -237,6 +238,7 @@ type RawDNS struct {
 	DefaultNameserver            []string                            `yaml:"default-nameserver" json:"default-nameserver"`
 	CacheAlgorithm               string                              `yaml:"cache-algorithm" json:"cache-algorithm"`
 	CacheMaxSize                 int                                 `yaml:"cache-max-size" json:"cache-max-size"`
+	CacheSaveInterval            int                                 `yaml:"cache-save-interval" json:"cache-save-interval"`
 	MinTTL                       uint32                              `yaml:"min-ttl" json:"min-ttl"`
 	MaxTTL                       uint32                              `yaml:"max-ttl" json:"max-ttl"`
 	NameServerPolicy             *orderedmap.OrderedMap[string, any] `yaml:"nameserver-policy" json:"nameserver-policy"`
@@ -1387,18 +1389,19 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 	}
 
 	dnsCfg := &DNS{
-		Enable:         cfg.Enable,
-		Listen:         cfg.Listen,
-		PreferH3:       cfg.PreferH3,
-		IPv6Timeout:    cfg.IPv6Timeout,
-		IPv6:           cfg.IPv6,
-		UseHosts:       cfg.UseHosts,
-		UseSystemHosts: cfg.UseSystemHosts,
-		EnhancedMode:   cfg.EnhancedMode,
-		CacheAlgorithm: cfg.CacheAlgorithm,
-		CacheMaxSize:   cfg.CacheMaxSize,
-		MinTTL:         cfg.MinTTL,
-		MaxTTL:         cfg.MaxTTL,
+		Enable:            cfg.Enable,
+		Listen:            cfg.Listen,
+		PreferH3:          cfg.PreferH3,
+		IPv6Timeout:       cfg.IPv6Timeout,
+		IPv6:              cfg.IPv6,
+		UseHosts:          cfg.UseHosts,
+		UseSystemHosts:    cfg.UseSystemHosts,
+		EnhancedMode:      cfg.EnhancedMode,
+		CacheAlgorithm:    cfg.CacheAlgorithm,
+		CacheMaxSize:      cfg.CacheMaxSize,
+		CacheSaveInterval: cfg.CacheSaveInterval,
+		MinTTL:            cfg.MinTTL,
+		MaxTTL:            cfg.MaxTTL,
 	}
 	var err error
 	if dnsCfg.NameServer, err = parseNameServer(cfg.NameServer, cfg.RespectRules, cfg.PreferH3); err != nil {
