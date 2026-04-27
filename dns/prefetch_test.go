@@ -167,6 +167,52 @@ func TestPrefetchColdEntryRemovedAfterServiceWindowEnds(t *testing.T) {
 	}
 }
 
+func TestPrefetchStoreMetaFiltersQtype(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	manager := &prefetchManager{
+		entries: make(map[string]*prefetchEntry),
+	}
+
+	allowed := []uint16{D.TypeA, D.TypeAAAA, D.TypeCNAME, D.TypeHTTPS}
+	for _, qtype := range allowed {
+		question := D.Question{Name: "allowed.example.", Qtype: qtype, Qclass: D.ClassINET}
+		key := question.String()
+		manager.storeMeta(dnsCacheMeta{
+			key:         key,
+			question:    question,
+			cachedAt:    now,
+			expire:      now.Add(time.Minute),
+			originalTTL: time.Minute,
+		})
+
+		entry := manager.entry(key)
+		if entry == nil {
+			t.Fatalf("expected qtype %s to be tracked", D.TypeToString[qtype])
+		}
+		if entry.question.Qtype != qtype {
+			t.Fatalf("expected qtype %s, got %s", D.TypeToString[qtype], D.TypeToString[entry.question.Qtype])
+		}
+	}
+
+	rejected := []uint16{D.TypeTXT, D.TypeMX, D.TypeSVCB}
+	for _, qtype := range rejected {
+		question := D.Question{Name: "rejected.example.", Qtype: qtype, Qclass: D.ClassINET}
+		key := question.String()
+		manager.entries[key] = &prefetchEntry{key: key, question: question}
+		manager.storeMeta(dnsCacheMeta{
+			key:         key,
+			question:    question,
+			cachedAt:    now,
+			expire:      now.Add(time.Minute),
+			originalTTL: time.Minute,
+		})
+
+		if manager.entry(key) != nil {
+			t.Fatalf("expected qtype %s to be removed from prefetch tracking", D.TypeToString[qtype])
+		}
+	}
+}
+
 func newPrefetchTestMsg(question D.Question) *D.Msg {
 	msg := &D.Msg{}
 	msg.SetQuestion(question.Name, question.Qtype)

@@ -158,6 +158,13 @@ func (p *prefetchManager) store(meta *dnsCacheMeta) {
 }
 
 func (p *prefetchManager) storeMeta(meta dnsCacheMeta) {
+	if !isPrefetchQtype(meta.question.Qtype) {
+		if meta.key != "" {
+			p.remove(meta.key)
+		}
+		return
+	}
+
 	p.mu.Lock()
 	entry := p.entries[meta.key]
 	if entry == nil {
@@ -176,6 +183,15 @@ func (p *prefetchManager) storeMeta(meta dnsCacheMeta) {
 
 	if meta.refreshCount > 0 {
 		entry.refreshCount.Store(meta.refreshCount)
+	}
+}
+
+func isPrefetchQtype(qtype uint16) bool {
+	switch qtype {
+	case D.TypeA, D.TypeAAAA, D.TypeCNAME, D.TypeHTTPS:
+		return true
+	default:
+		return false
 	}
 }
 
