@@ -215,6 +215,49 @@ func TestPrefetchStoreMetaFiltersQtype(t *testing.T) {
 	}
 }
 
+func TestPrefetchStoreMetaPublishesInitializedEntry(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	question := D.Question{Name: "initialized.example.", Qtype: D.TypeA, Qclass: D.ClassINET}
+	key := question.String()
+	manager := &prefetchManager{entries: make(map[string]*prefetchEntry)}
+
+	manager.storeMeta(dnsCacheMeta{
+		key:          key,
+		question:     question,
+		cachedAt:     now,
+		expire:       now.Add(time.Minute),
+		originalTTL:  time.Minute,
+		refreshCount: 3,
+	})
+
+	entry := manager.entry(key)
+	if entry == nil {
+		t.Fatal("expected entry to be published")
+	}
+	entry.mu.Lock()
+	gotQuestion := entry.question
+	gotCachedAt := entry.cachedAt
+	gotExpire := entry.expire
+	gotOriginalTTL := entry.originalTTL
+	entry.mu.Unlock()
+
+	if gotQuestion != question {
+		t.Fatalf("question = %#v, want %#v", gotQuestion, question)
+	}
+	if !gotCachedAt.Equal(now) {
+		t.Fatalf("cachedAt = %s, want %s", gotCachedAt, now)
+	}
+	if !gotExpire.Equal(now.Add(time.Minute)) {
+		t.Fatalf("expire = %s, want %s", gotExpire, now.Add(time.Minute))
+	}
+	if gotOriginalTTL != time.Minute {
+		t.Fatalf("original TTL = %s, want %s", gotOriginalTTL, time.Minute)
+	}
+	if got := entry.refreshCount.Load(); got != 3 {
+		t.Fatalf("refresh count = %d, want 3", got)
+	}
+}
+
 func TestPrefetchCandidatesSortedByUrgencyAndHeat(t *testing.T) {
 	now := time.Unix(1700000000, 0)
 	cache := lru.New[string, *D.Msg](lru.WithStale[string, *D.Msg](true))
@@ -358,6 +401,51 @@ func TestPrefetchCandidateRemovesMissingCacheWithoutExistCheck(t *testing.T) {
 	}
 	if cache.getCalls != 1 {
 		t.Fatalf("GetWithExpire calls = %d, want 1", cache.getCalls)
+	}
+}
+
+func TestPrefetchCandidateSkipsCacheLookupForIneligibleEntry(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	question := D.Question{Name: "skip-lookup.example.", Qtype: D.TypeA, Qclass: D.ClassINET}
+	key := question.String()
+	cache := &prefetchLookupCache{
+		msg:    newPrefetchTestMsg(question),
+		expire: now.Add(time.Minute),
+		hit:    true,
+	}
+	manager := &prefetchManager{
+		resolver: &Resolver{cache: cache, optimisticCacheTTL: time.Hour},
+		config: prefetchConfig{
+			threshold:    defaultPrefetchThreshold,
+			minRefreshes: defaultPrefetchMinRefreshes,
+		},
+		entries: make(map[string]*prefetchEntry),
+	}
+
+	cold := &prefetchEntry{key: key, question: question, expire: now.Add(5 * time.Second)}
+	cold.refreshCount.Store(defaultPrefetchMinRefreshes - 1)
+	if _, ok := manager.prefetchCandidate(cold, now); ok {
+		t.Fatal("expected cold entry to be ineligible")
+	}
+
+	cooling := &prefetchEntry{key: key, question: question, expire: now.Add(5 * time.Second)}
+	cooling.refreshCount.Store(defaultPrefetchMinRefreshes)
+	cooling.nextPrefetchAttempt = now.Add(time.Minute)
+	if _, ok := manager.prefetchCandidate(cooling, now); ok {
+		t.Fatal("expected cooling entry to be ineligible")
+	}
+
+	early := &prefetchEntry{key: key, question: question, expire: now.Add(time.Hour)}
+	early.refreshCount.Store(defaultPrefetchMinRefreshes)
+	if _, ok := manager.prefetchCandidate(early, now); ok {
+		t.Fatal("expected entry outside prefetch window to be ineligible")
+	}
+
+	if cache.getCalls != 0 {
+		t.Fatalf("GetWithExpire calls = %d, want 0", cache.getCalls)
+	}
+	if cache.existCalls != 0 {
+		t.Fatalf("Exist calls = %d, want 0", cache.existCalls)
 	}
 }
 

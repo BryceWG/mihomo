@@ -179,8 +179,10 @@ func (p *prefetchManager) storeMeta(meta dnsCacheMeta) {
 	p.mu.Lock()
 	entry := p.entries[meta.key]
 	if entry == nil {
-		entry = &prefetchEntry{key: meta.key}
+		entry = newPrefetchEntry(meta)
 		p.entries[meta.key] = entry
+		p.mu.Unlock()
+		return
 	}
 	p.mu.Unlock()
 
@@ -195,6 +197,20 @@ func (p *prefetchManager) storeMeta(meta dnsCacheMeta) {
 	if meta.refreshCount > 0 {
 		entry.refreshCount.Store(meta.refreshCount)
 	}
+}
+
+func newPrefetchEntry(meta dnsCacheMeta) *prefetchEntry {
+	entry := &prefetchEntry{
+		key: meta.key,
+	}
+	entry.question = meta.question
+	entry.cachedAt = meta.cachedAt
+	entry.expire = meta.expire
+	entry.originalTTL = meta.originalTTL
+	if meta.refreshCount > 0 {
+		entry.refreshCount.Store(meta.refreshCount)
+	}
+	return entry
 }
 
 func isPrefetchQtype(qtype uint16) bool {
@@ -399,14 +415,6 @@ func (p *prefetchManager) prefetchCandidate(entry *prefetchEntry, now time.Time)
 	question := entry.question
 	entry.mu.Unlock()
 
-	msg, cacheExpire, hit := getMsgFromCache(p.resolver.cache, question)
-	if !hit || msg == nil {
-		p.remove(entry.key)
-		return prefetchCandidate{}, false
-	}
-	if !cacheExpire.Equal(expire) {
-		return prefetchCandidate{}, false
-	}
 	refreshCount := entry.refreshCount.Load()
 	if refreshCount < p.config.minRefreshes {
 		if p.shouldRemoveColdEntry(entry, now) {
@@ -425,6 +433,15 @@ func (p *prefetchManager) prefetchCandidate(entry *prefetchEntry, now time.Time)
 		return prefetchCandidate{}, false
 	}
 	if p.resolver.optimisticCacheTTL > 0 && remaining < -p.resolver.optimisticCacheTTL {
+		return prefetchCandidate{}, false
+	}
+
+	msg, cacheExpire, hit := getMsgFromCache(p.resolver.cache, question)
+	if !hit || msg == nil {
+		p.remove(entry.key)
+		return prefetchCandidate{}, false
+	}
+	if !cacheExpire.Equal(expire) {
 		return prefetchCandidate{}, false
 	}
 	return prefetchCandidate{
