@@ -48,8 +48,9 @@ type prefetchEntry struct {
 	prefetchFailureCount int32
 	nextPrefetchAttempt  time.Time
 
-	refreshCount atomic.Int32
-	inFlight     atomic.Bool
+	refreshCount      atomic.Int32
+	refreshCountDirty atomic.Bool
+	inFlight          atomic.Bool
 }
 
 type prefetchManager struct {
@@ -140,6 +141,7 @@ func (p *prefetchManager) stopLoop() {
 		close(p.stop)
 		<-p.done
 		p.wg.Wait()
+		p.syncRefreshCounts()
 	})
 }
 
@@ -267,8 +269,8 @@ func (p *prefetchManager) addRefreshCount(entry *prefetchEntry, delta int32) {
 	if delta <= 0 {
 		return
 	}
-	newCount := entry.refreshCount.Add(delta)
-	p.persistRefreshCount(entry.key, newCount)
+	entry.refreshCount.Add(delta)
+	entry.refreshCountDirty.Store(true)
 }
 
 func (p *prefetchManager) applyDecay(entry *prefetchEntry) {
@@ -279,22 +281,60 @@ func (p *prefetchManager) applyDecay(entry *prefetchEntry) {
 			next = 0
 		}
 		if entry.refreshCount.CompareAndSwap(old, next) {
-			p.persistRefreshCount(entry.key, next)
+			entry.refreshCountDirty.Store(true)
 			return
 		}
 	}
 }
 
-func (p *prefetchManager) persistRefreshCount(key string, count int32) {
-	cache, ok := p.resolver.cache.(interface {
-		SetPrefetchRefreshCount(string, int32)
+func (p *prefetchManager) syncRefreshCounts() {
+	if p == nil || p.resolver == nil || p.resolver.cache == nil {
+		return
+	}
+
+	p.mu.RLock()
+	entries := make([]*prefetchEntry, 0, len(p.entries))
+	for _, entry := range p.entries {
+		entries = append(entries, entry)
+	}
+	p.mu.RUnlock()
+
+	counts := make(map[string]int32)
+	for _, entry := range entries {
+		if !entry.refreshCountDirty.Swap(false) {
+			continue
+		}
+		counts[entry.key] = entry.refreshCount.Load()
+	}
+	if len(counts) == 0 {
+		return
+	}
+	p.persistRefreshCounts(counts)
+}
+
+func (p *prefetchManager) persistRefreshCounts(counts map[string]int32) {
+	batchCache, ok := p.resolver.cache.(interface {
+		SetPrefetchRefreshCounts(map[string]int32)
 	})
 	if ok {
-		cache.SetPrefetchRefreshCount(key, count)
+		batchCache.SetPrefetchRefreshCounts(counts)
+		return
+	}
+
+	singleCache, ok := p.resolver.cache.(interface {
+		SetPrefetchRefreshCount(string, int32)
+	})
+	if !ok {
+		return
+	}
+	for key, count := range counts {
+		singleCache.SetPrefetchRefreshCount(key, count)
 	}
 }
 
 func (p *prefetchManager) scan(now time.Time) {
+	defer p.syncRefreshCounts()
+
 	p.mu.RLock()
 	entries := make([]*prefetchEntry, 0, len(p.entries))
 	for _, entry := range p.entries {
@@ -353,23 +393,8 @@ func (p *prefetchManager) prefetchCandidates(entries []*prefetchEntry, now time.
 }
 
 func (p *prefetchManager) prefetchCandidate(entry *prefetchEntry, now time.Time) (prefetchCandidate, bool) {
-	if !p.resolver.cache.Exist(entry.key) {
-		p.remove(entry.key)
-		return prefetchCandidate{}, false
-	}
-	refreshCount := entry.refreshCount.Load()
-	if refreshCount < p.config.minRefreshes {
-		if p.shouldRemoveColdEntry(entry, now) {
-			p.remove(entry.key)
-		}
-		return prefetchCandidate{}, false
-	}
-
 	entry.mu.Lock()
-	if !entry.nextPrefetchAttempt.IsZero() && now.Before(entry.nextPrefetchAttempt) {
-		entry.mu.Unlock()
-		return prefetchCandidate{}, false
-	}
+	nextPrefetchAttempt := entry.nextPrefetchAttempt
 	expire := entry.expire
 	question := entry.question
 	entry.mu.Unlock()
@@ -380,6 +405,16 @@ func (p *prefetchManager) prefetchCandidate(entry *prefetchEntry, now time.Time)
 		return prefetchCandidate{}, false
 	}
 	if !cacheExpire.Equal(expire) {
+		return prefetchCandidate{}, false
+	}
+	refreshCount := entry.refreshCount.Load()
+	if refreshCount < p.config.minRefreshes {
+		if p.shouldRemoveColdEntry(entry, now) {
+			p.remove(entry.key)
+		}
+		return prefetchCandidate{}, false
+	}
+	if !nextPrefetchAttempt.IsZero() && now.Before(nextPrefetchAttempt) {
 		return prefetchCandidate{}, false
 	}
 	remaining := expire.Sub(now)
@@ -499,7 +534,7 @@ func (p *prefetchManager) prefetchFailureBackoff(key string, failureCount int32)
 func (p *prefetchManager) doPrefetch(entry *prefetchEntry) {
 	entry.mu.Lock()
 	question := entry.question
-	oldCachedAt := entry.cachedAt
+	oldExpire := entry.expire
 	entry.mu.Unlock()
 
 	msg := &D.Msg{}
@@ -509,7 +544,6 @@ func (p *prefetchManager) doPrefetch(entry *prefetchEntry) {
 	ctx, cancel := context.WithTimeout(context.Background(), p.config.timeout)
 	defer cancel()
 
-	start := time.Now()
 	resp, err := p.resolver.exchangeWithoutCache(ctx, msg, false)
 	if err != nil || resp == nil || resp.Rcode == D.RcodeServerFailure {
 		p.recordPrefetchFailure(entry, time.Now())
@@ -518,10 +552,7 @@ func (p *prefetchManager) doPrefetch(entry *prefetchEntry) {
 		return
 	}
 
-	entry.mu.Lock()
-	refreshed := entry.cachedAt.After(oldCachedAt) && !entry.cachedAt.Before(start)
-	entry.mu.Unlock()
-	if !refreshed {
+	if !p.prefetchUpdatedCache(question, oldExpire) {
 		p.recordPrefetchFailure(entry, time.Now())
 		p.resolver.stats.recordPrefetch(false)
 		return
@@ -530,6 +561,11 @@ func (p *prefetchManager) doPrefetch(entry *prefetchEntry) {
 	p.recordPrefetchSuccess(entry)
 	p.applyDecay(entry)
 	p.resolver.stats.recordPrefetch(true)
+}
+
+func (p *prefetchManager) prefetchUpdatedCache(question D.Question, oldExpire time.Time) bool {
+	msg, cacheExpire, hit := getMsgFromCache(p.resolver.cache, question)
+	return hit && msg != nil && cacheExpire.After(oldExpire)
 }
 
 func (r *Resolver) updatePrefetchMeta(meta *dnsCacheMeta) {

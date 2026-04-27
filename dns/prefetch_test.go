@@ -327,6 +327,102 @@ func TestPrefetchScanSkipsInFlightCandidates(t *testing.T) {
 	manager.wg.Wait()
 }
 
+func TestPrefetchCandidateRemovesMissingCacheWithoutExistCheck(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	question := D.Question{Name: "missing.example.", Qtype: D.TypeA, Qclass: D.ClassINET}
+	key := question.String()
+	cache := &prefetchLookupCache{}
+	entry := &prefetchEntry{
+		key:      key,
+		question: question,
+		expire:   now.Add(5 * time.Second),
+	}
+	entry.refreshCount.Store(defaultPrefetchMinRefreshes)
+	manager := &prefetchManager{
+		resolver: &Resolver{cache: cache},
+		config: prefetchConfig{
+			threshold:    defaultPrefetchThreshold,
+			minRefreshes: defaultPrefetchMinRefreshes,
+		},
+		entries: map[string]*prefetchEntry{key: entry},
+	}
+
+	if _, ok := manager.prefetchCandidate(entry, now); ok {
+		t.Fatal("expected missing cache entry to be ineligible")
+	}
+	if manager.entry(key) != nil {
+		t.Fatal("expected missing cache entry to be removed")
+	}
+	if cache.existCalls != 0 {
+		t.Fatalf("Exist calls = %d, want 0", cache.existCalls)
+	}
+	if cache.getCalls != 1 {
+		t.Fatalf("GetWithExpire calls = %d, want 1", cache.getCalls)
+	}
+}
+
+func TestPrefetchUpdatedCacheRequiresExpireAdvance(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	question := D.Question{Name: "refreshed.example.", Qtype: D.TypeA, Qclass: D.ClassINET}
+	key := question.String()
+	cache := lru.New[string, *D.Msg](lru.WithStale[string, *D.Msg](true))
+	manager := &prefetchManager{resolver: &Resolver{cache: cache}}
+
+	oldExpire := now.Add(10 * time.Second)
+	cache.SetWithExpire(key, newPrefetchTestMsg(question), oldExpire)
+	if manager.prefetchUpdatedCache(question, oldExpire) {
+		t.Fatal("expected unchanged cache expire not to count as a refresh")
+	}
+
+	cache.SetWithExpire(key, newPrefetchTestMsg(question), oldExpire.Add(time.Minute))
+	if !manager.prefetchUpdatedCache(question, oldExpire) {
+		t.Fatal("expected advanced cache expire to count as a refresh")
+	}
+}
+
+func TestPrefetchRefreshCountSyncBatchesPersistence(t *testing.T) {
+	question := D.Question{Name: "sync-count.example.", Qtype: D.TypeA, Qclass: D.ClassINET}
+	key := question.String()
+	cache := &prefetchRefreshCountCache{counts: make(map[string]int32)}
+	entry := &prefetchEntry{key: key, question: question}
+	manager := &prefetchManager{
+		resolver: &Resolver{cache: cache},
+		config:   prefetchConfig{decay: 1},
+		entries:  map[string]*prefetchEntry{key: entry},
+	}
+
+	manager.addRefreshCount(entry, 1)
+	manager.addRefreshCount(entry, 1)
+	if cache.batchWrites != 0 || cache.singleWrites != 0 {
+		t.Fatalf("refresh count persisted on hot path, batch=%d single=%d", cache.batchWrites, cache.singleWrites)
+	}
+
+	manager.syncRefreshCounts()
+	if cache.counts[key] != 2 {
+		t.Fatalf("persisted refresh count = %d, want 2", cache.counts[key])
+	}
+	if cache.batchWrites != 1 {
+		t.Fatalf("batch writes = %d, want 1", cache.batchWrites)
+	}
+
+	manager.syncRefreshCounts()
+	if cache.batchWrites != 1 {
+		t.Fatalf("batch writes after clean sync = %d, want 1", cache.batchWrites)
+	}
+
+	manager.applyDecay(entry)
+	if cache.batchWrites != 1 {
+		t.Fatalf("decay persisted on hot path, batch writes = %d, want 1", cache.batchWrites)
+	}
+	manager.syncRefreshCounts()
+	if cache.counts[key] != 1 {
+		t.Fatalf("persisted refresh count after decay = %d, want 1", cache.counts[key])
+	}
+	if cache.batchWrites != 2 {
+		t.Fatalf("batch writes after decay sync = %d, want 2", cache.batchWrites)
+	}
+}
+
 func newPrefetchTestMsg(question D.Question) *D.Msg {
 	msg := &D.Msg{}
 	msg.SetQuestion(question.Name, question.Qtype)
@@ -403,5 +499,46 @@ func waitPrefetchStarted(t *testing.T, started *atomic.Int32, want int32) int32 
 			return started.Load()
 		case <-ticker.C:
 		}
+	}
+}
+
+type prefetchLookupCache struct {
+	msg        *D.Msg
+	expire     time.Time
+	hit        bool
+	getCalls   int
+	existCalls int
+}
+
+func (c *prefetchLookupCache) GetWithExpire(string) (*D.Msg, time.Time, bool) {
+	c.getCalls++
+	return c.msg, c.expire, c.hit
+}
+
+func (c *prefetchLookupCache) SetWithExpire(string, *D.Msg, time.Time) {}
+
+func (c *prefetchLookupCache) Exist(string) bool {
+	c.existCalls++
+	return c.hit
+}
+
+func (c *prefetchLookupCache) Clear() {}
+
+type prefetchRefreshCountCache struct {
+	prefetchLookupCache
+	counts       map[string]int32
+	batchWrites  int
+	singleWrites int
+}
+
+func (c *prefetchRefreshCountCache) SetPrefetchRefreshCount(key string, count int32) {
+	c.singleWrites++
+	c.counts[key] = count
+}
+
+func (c *prefetchRefreshCountCache) SetPrefetchRefreshCounts(counts map[string]int32) {
+	c.batchWrites++
+	for key, count := range counts {
+		c.counts[key] = count
 	}
 }

@@ -444,6 +444,9 @@ func (r *Resolver) StoreDNSCache() {
 	if r == nil {
 		return
 	}
+	if r.prefetch != nil {
+		r.prefetch.syncRefreshCounts()
+	}
 	if cache, ok := r.cache.(interface{ Store() }); ok {
 		cache.Store()
 	}

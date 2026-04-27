@@ -263,12 +263,21 @@ func (c *persistentDNSCache) PrefetchMetadata() map[string]dnsCacheMeta {
 }
 
 func (c *persistentDNSCache) SetPrefetchRefreshCount(key string, count int32) {
+	c.SetPrefetchRefreshCounts(map[string]int32{key: count})
+}
+
+func (c *persistentDNSCache) SetPrefetchRefreshCounts(counts map[string]int32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if record, ok := c.records[key]; ok {
-		record.refreshCount = count
-		c.dirty = true
+	for key, count := range counts {
+		if record, ok := c.records[key]; ok {
+			if record.refreshCount == count {
+				continue
+			}
+			record.refreshCount = count
+			c.dirty = true
+		}
 	}
 }
 
