@@ -310,6 +310,9 @@ func (p *prefetchManager) shouldPrefetch(entry *prefetchEntry, now time.Time) bo
 		return false
 	}
 	if entry.refreshCount.Load() < p.config.minRefreshes {
+		if p.shouldRemoveColdEntry(entry, now) {
+			p.remove(entry.key)
+		}
 		return false
 	}
 
@@ -341,6 +344,20 @@ func (p *prefetchManager) shouldPrefetch(entry *prefetchEntry, now time.Time) bo
 		return false
 	}
 	return true
+}
+
+func (p *prefetchManager) shouldRemoveColdEntry(entry *prefetchEntry, now time.Time) bool {
+	entry.mu.Lock()
+	expire := entry.expire
+	entry.mu.Unlock()
+
+	if expire.IsZero() {
+		return false
+	}
+	if p.resolver.optimisticCacheTTL > 0 {
+		expire = expire.Add(p.resolver.optimisticCacheTTL)
+	}
+	return now.After(expire)
 }
 
 func (p *prefetchManager) recordPrefetchFailure(entry *prefetchEntry, now time.Time) {

@@ -103,6 +103,70 @@ func TestPrefetchSuccessClearsFailureCooldown(t *testing.T) {
 	}
 }
 
+func TestPrefetchColdEntryRetainedBeforeServiceWindowEnds(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	question := D.Question{Name: "cold-retained.example.", Qtype: D.TypeA, Qclass: D.ClassINET}
+	key := question.String()
+	expire := now.Add(-30 * time.Second)
+	cache := lru.New[string, *D.Msg](lru.WithStale[string, *D.Msg](true))
+	cache.SetWithExpire(key, newPrefetchTestMsg(question), expire)
+
+	entry := &prefetchEntry{
+		key:      key,
+		question: question,
+		expire:   expire,
+	}
+
+	manager := &prefetchManager{
+		resolver: &Resolver{cache: cache, optimisticCacheTTL: time.Hour},
+		config: prefetchConfig{
+			scanInterval: defaultPrefetchScanInterval,
+			threshold:    defaultPrefetchThreshold,
+			minRefreshes: defaultPrefetchMinRefreshes,
+		},
+		entries: map[string]*prefetchEntry{key: entry},
+	}
+
+	if manager.shouldPrefetch(entry, now) {
+		t.Fatal("expected cold entry to stay ineligible for prefetch")
+	}
+	if manager.entry(key) == nil {
+		t.Fatal("expected cold entry to be retained within optimistic service window")
+	}
+}
+
+func TestPrefetchColdEntryRemovedAfterServiceWindowEnds(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	question := D.Question{Name: "cold-removed.example.", Qtype: D.TypeA, Qclass: D.ClassINET}
+	key := question.String()
+	expire := now.Add(-time.Hour - time.Second)
+	cache := lru.New[string, *D.Msg](lru.WithStale[string, *D.Msg](true))
+	cache.SetWithExpire(key, newPrefetchTestMsg(question), expire)
+
+	entry := &prefetchEntry{
+		key:      key,
+		question: question,
+		expire:   expire,
+	}
+
+	manager := &prefetchManager{
+		resolver: &Resolver{cache: cache, optimisticCacheTTL: time.Hour},
+		config: prefetchConfig{
+			scanInterval: defaultPrefetchScanInterval,
+			threshold:    defaultPrefetchThreshold,
+			minRefreshes: defaultPrefetchMinRefreshes,
+		},
+		entries: map[string]*prefetchEntry{key: entry},
+	}
+
+	if manager.shouldPrefetch(entry, now) {
+		t.Fatal("expected cold entry to stay ineligible for prefetch")
+	}
+	if manager.entry(key) != nil {
+		t.Fatal("expected cold entry to be removed after optimistic service window")
+	}
+}
+
 func newPrefetchTestMsg(question D.Question) *D.Msg {
 	msg := &D.Msg{}
 	msg.SetQuestion(question.Name, question.Qtype)
